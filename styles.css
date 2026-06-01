@@ -162,6 +162,23 @@ h2 {
   font-size: 0.9rem;
 }
 
+.user-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 42px;
+  max-width: 180px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-weight: 900;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .icon-button,
 .ghost-button,
 .primary-button {
@@ -236,7 +253,7 @@ h2 {
 
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
@@ -382,7 +399,7 @@ input[readonly] {
 
 .records-toolbar {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr);
+  grid-template-columns: minmax(220px, 1fr) minmax(160px, 220px);
   gap: 10px;
   padding: 14px;
   border-bottom: 1px solid var(--line);
@@ -419,7 +436,7 @@ input[readonly] {
 
 table {
   width: 100%;
-  min-width: 620px;
+  min-width: 760px;
   border-collapse: separate;
   border-spacing: 0;
 }
@@ -568,6 +585,10 @@ tbody tr:hover td {
 
   .summary-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .records-toolbar {
+    grid-template-columns: 1fr;
   }
 }
 

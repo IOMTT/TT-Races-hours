@@ -1,6 +1,8 @@
 const storageKey = "hours-tracker-rows";
-const fixedFirstName = "Caitlin";
-const fixedLastName = "Beaty";
+const draftKey = "hours-tracker-entry-draft";
+const remoteRecordsEndpoint = "/api/records";
+const defaultFirstName = "Caitlin";
+const defaultLastName = "Beaty";
 const fixedHourlyRate = 18;
 
 const seededWeekRecords = [
@@ -14,6 +16,7 @@ const seededWeekRecords = [
 
 const fields = [
   { key: "dateWorked", header: "Date", date: true },
+  { key: "fullName", header: "Person" },
   { key: "hoursQty", header: "Hours", numeric: true },
   { key: "cashAmount", header: "Amount per hour", numeric: true, money: true },
   { key: "totalForDate", header: "Total for date", numeric: true, money: true },
@@ -22,6 +25,7 @@ const fields = [
 const exportFields = fields;
 const excelColumnWidths = {
   dateWorked: 16,
+  fullName: 24,
   hoursQty: 12,
   cashAmount: 18,
   totalForDate: 18,
@@ -31,12 +35,15 @@ const form = document.querySelector("#entryForm");
 const recordsBody = document.querySelector("#recordsBody");
 const rowTemplate = document.querySelector("#rowTemplate");
 const searchInput = document.querySelector("#searchInput");
+const personFilter = document.querySelector("#personFilter");
 const exportButton = document.querySelector("#exportCsv");
 const exportExcelButton = document.querySelector("#exportExcel");
 const excelFileNameInput = document.querySelector("#excelFileName");
 const importButton = document.querySelector("#importFileButton");
 const importInput = document.querySelector("#fileImport");
 const clearAllButton = document.querySelector("#clearAll");
+const logoutButton = document.querySelector("#logoutButton");
+const currentUserLabel = document.querySelector("#currentUserLabel");
 const cancelEditButton = document.querySelector("#cancelEdit");
 const formTitle = document.querySelector("#formTitle");
 const submitLabel = document.querySelector("#submitLabel");
@@ -48,11 +55,13 @@ const totals = {
   hours: document.querySelector("#totalHours"),
   cash: document.querySelector("#totalCash"),
   entries: document.querySelector("#entryCount"),
+  people: document.querySelector("#peopleCount"),
   days: document.querySelector("#dayCount"),
 };
 
 let records = loadRecords();
 let sortState = { key: "dateWorked", direction: "ascending" };
+let currentUser = null;
 
 function loadRecords() {
   const seededRecords = mergeSeededWeekRecords(readStoredRecords());
@@ -60,8 +69,198 @@ function loadRecords() {
   return seededRecords;
 }
 
-function saveRecords() {
+function saveRecords(options = {}) {
   persistRecords(records);
+  if (options.replaceRemote) {
+    void saveRemoteRecords(records);
+  } else if (options.upsertRemoteRecords?.length) {
+    void upsertRemoteRecords(options.upsertRemoteRecords);
+  }
+}
+
+function canUseRemoteRecords() {
+  return location.protocol === "http:" || location.protocol === "https:";
+}
+
+function handleAuthFailure(response) {
+  if (response.status !== 401) return false;
+  window.location.href = "/";
+  return true;
+}
+
+async function loadCurrentUser() {
+  if (!canUseRemoteRecords()) return;
+
+  try {
+    const response = await fetch("/api/me", {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (handleAuthFailure(response)) return;
+    if (!response.ok) return;
+
+    const payload = await response.json();
+    currentUser = payload.user || null;
+    renderCurrentUser();
+  } catch (error) {
+    console.warn(error);
+  }
+}
+
+function renderCurrentUser() {
+  if (!currentUser || !currentUserLabel) return;
+  currentUserLabel.textContent = currentUser.name || currentUser.email || currentUser.username;
+  currentUserLabel.hidden = false;
+}
+
+function currentUserId() {
+  return currentUser?.email || currentUser?.username || "";
+}
+
+function withCurrentUserAudit(record, existingRecord = {}) {
+  const userId = currentUserId();
+  if (!userId) return { ...existingRecord, ...record };
+
+  return {
+    ...existingRecord,
+    ...record,
+    createdBy: existingRecord.createdBy || userId,
+    updatedBy: userId,
+  };
+}
+
+async function syncRemoteRecords() {
+  if (!canUseRemoteRecords()) return;
+
+  try {
+    const response = await fetch(remoteRecordsEndpoint, {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (handleAuthFailure(response)) return;
+    if (!response.ok) throw new Error(`Remote load failed: ${response.status}`);
+
+    const payload = await response.json();
+    const remoteRecords = Array.isArray(payload.records) ? payload.records.map(normaliseRecord) : [];
+    if (remoteRecords.length) {
+      applyRemoteRecords(remoteRecords);
+    } else if (records.length) {
+      await saveRemoteRecords(records, { silent: true });
+    }
+  } catch (error) {
+    console.warn(error);
+  }
+}
+
+async function saveRemoteRecords(items, options = {}) {
+  if (!canUseRemoteRecords()) return;
+
+  try {
+    const response = await fetch(remoteRecordsEndpoint, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ records: items }),
+    });
+    if (handleAuthFailure(response)) return;
+    if (!response.ok) throw new Error(`Remote save failed: ${response.status}`);
+  } catch (error) {
+    console.warn(error);
+    if (!options.silent) showToast("Saved on this browser. Cloudflare sync failed.");
+  }
+}
+
+async function upsertRemoteRecords(items, options = {}) {
+  if (!canUseRemoteRecords()) return;
+
+  try {
+    const response = await fetch(remoteRecordsEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ records: items }),
+    });
+    if (handleAuthFailure(response)) return;
+    if (!response.ok) throw new Error(`Remote save failed: ${response.status}`);
+
+    const payload = await response.json();
+    if (Array.isArray(payload.records)) {
+      applyRemoteRecords(payload.records.map(normaliseRecord));
+    }
+  } catch (error) {
+    console.warn(error);
+    if (!options.silent) showToast("Saved on this browser. Cloudflare sync failed.");
+  }
+}
+
+async function deleteRemoteRecords(ids, options = {}) {
+  if (!canUseRemoteRecords()) return;
+
+  try {
+    const response = await fetch(remoteRecordsEndpoint, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+    if (handleAuthFailure(response)) return;
+    if (!response.ok) throw new Error(`Remote delete failed: ${response.status}`);
+
+    const payload = await response.json();
+    if (Array.isArray(payload.records)) {
+      applyRemoteRecords(payload.records.map(normaliseRecord));
+    }
+  } catch (error) {
+    console.warn(error);
+    if (!options.silent) showToast("Deleted on this browser. Cloudflare sync failed.");
+  }
+}
+
+function loadDraft() {
+  try {
+    const draft = JSON.parse(localStorage.getItem(draftKey) || "{}");
+    return draft && typeof draft === "object" ? draft : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveDraft() {
+  const draft = {
+    editingId: document.querySelector("#editingId").value,
+    firstName: document.querySelector("#firstName").value,
+    lastName: document.querySelector("#lastName").value,
+    dateWorked: document.querySelector("#dateWorked").value,
+    hoursQty: hoursInput.value,
+  };
+
+  try {
+    localStorage.setItem(draftKey, JSON.stringify(draft));
+  } catch {}
+}
+
+function clearDraft() {
+  try {
+    localStorage.removeItem(draftKey);
+  } catch {}
+}
+
+function restoreDraft() {
+  const draft = loadDraft();
+  const hasDraft = draft.firstName || draft.lastName || draft.dateWorked || draft.hoursQty || draft.editingId;
+  if (!hasDraft) return;
+
+  const isEditing = draft.editingId && records.some((record) => record.id === draft.editingId);
+  document.querySelector("#editingId").value = isEditing ? draft.editingId : "";
+  document.querySelector("#firstName").value = textWithDefault(draft, "firstName", defaultFirstName);
+  document.querySelector("#lastName").value = textWithDefault(draft, "lastName", defaultLastName);
+  document.querySelector("#dateWorked").value = draft.dateWorked || "";
+  document.querySelector("#cashAmount").value = fixedHourlyRate.toFixed(2);
+  hoursInput.value = draft.hoursQty ?? "";
+  updateDateTotal();
+
+  if (isEditing) {
+    formTitle.textContent = "Edit hours";
+    submitLabel.textContent = "Update hours";
+    cancelEditButton.hidden = false;
+  }
 }
 
 function readStoredRecords() {
@@ -79,19 +278,32 @@ function persistRecords(items) {
   } catch {}
 }
 
+function textWithDefault(record, key, fallback) {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) return fallback;
+  return String(record[key] ?? "").trim();
+}
+
+function applyRemoteRecords(remoteRecords) {
+  records = mergeSeededWeekRecords(remoteRecords);
+  persistRecords(records);
+  render();
+}
+
 function normaliseRecord(record) {
   return {
     ...record,
-    firstName: fixedFirstName,
-    lastName: fixedLastName,
+    firstName: textWithDefault(record, "firstName", defaultFirstName),
+    lastName: textWithDefault(record, "lastName", defaultLastName),
     cashAmount: fixedHourlyRate,
   };
 }
 
 function mergeSeededWeekRecords(existingRecords) {
   const seededIds = new Set(seededWeekRecords.map((record) => record.id));
+  const existingById = new Map(existingRecords.map((record) => [record.id, record]));
   const customRecords = existingRecords.filter((record) => !seededIds.has(record.id));
-  return [...seededWeekRecords.map(normaliseRecord), ...customRecords];
+  const seededRecords = seededWeekRecords.map((record) => normaliseRecord(existingById.get(record.id) || record));
+  return [...seededRecords, ...customRecords];
 }
 
 function money(value) {
@@ -120,10 +332,10 @@ function makeId() {
 function getFormValues() {
   return {
     id: document.querySelector("#editingId").value || makeId(),
+    firstName: document.querySelector("#firstName").value.trim(),
+    lastName: document.querySelector("#lastName").value.trim(),
     dateWorked: document.querySelector("#dateWorked").value,
     comments: "",
-    firstName: fixedFirstName,
-    lastName: fixedLastName,
     cashAmount: fixedHourlyRate,
     hoursQty: Number(hoursInput.value || 0),
   };
@@ -131,6 +343,8 @@ function getFormValues() {
 
 function setFormValues(record) {
   document.querySelector("#editingId").value = record.id || "";
+  document.querySelector("#firstName").value = textWithDefault(record, "firstName", defaultFirstName);
+  document.querySelector("#lastName").value = textWithDefault(record, "lastName", defaultLastName);
   document.querySelector("#dateWorked").value = record.dateWorked || "";
   document.querySelector("#cashAmount").value = fixedHourlyRate.toFixed(2);
   hoursInput.value = record.hoursQty ?? "";
@@ -140,8 +354,11 @@ function setFormValues(record) {
 function resetForm() {
   form.reset();
   document.querySelector("#editingId").value = "";
+  document.querySelector("#firstName").value = defaultFirstName;
+  document.querySelector("#lastName").value = defaultLastName;
   document.querySelector("#cashAmount").value = fixedHourlyRate.toFixed(2);
   updateDateTotal();
+  clearDraft();
   formTitle.textContent = "Add hours";
   submitLabel.textContent = "Save hours";
   cancelEditButton.hidden = true;
@@ -151,8 +368,17 @@ function rowTotal(record) {
   return (Number(record.cashAmount) || fixedHourlyRate) * (Number(record.hoursQty) || 0);
 }
 
+function fullName(record) {
+  return [record.firstName, record.lastName].filter(Boolean).join(" ").trim();
+}
+
+function personKey(record) {
+  return fullName(record).toLowerCase();
+}
+
 function getFieldValue(record, field) {
   if (field.key === "totalForDate") return rowTotal(record);
+  if (field.key === "fullName") return fullName(record);
   if (field.key === "cashAmount") return Number(record.cashAmount) || fixedHourlyRate;
   if (field.key === "dateWorked") return normaliseDate(record.dateWorked);
   return record[field.key];
@@ -172,9 +398,12 @@ function updateDateTotal() {
 
 function filteredRecords() {
   const query = searchInput.value.trim().toLowerCase();
+  const person = personFilter.value;
 
   return records.filter((record) => {
-    return !query || fields.some((field) => formatFieldValue(record, field).toLowerCase().includes(query));
+    const matchesPerson = !person || personKey(record) === person;
+    const matchesSearch = !query || fields.some((field) => formatFieldValue(record, field).toLowerCase().includes(query));
+    return matchesPerson && matchesSearch;
   });
 }
 
@@ -202,11 +431,13 @@ function renderTotals() {
     (sum, record) => sum + (Number(record.cashAmount) || 0) * (Number(record.hoursQty) || 0),
     0,
   );
+  const people = new Set(visibleRecords.map(personKey).filter(Boolean));
   const days = new Set(visibleRecords.map((record) => record.dateWorked).filter(Boolean));
 
   totals.hours.textContent = number(hours);
   totals.cash.textContent = money(cash);
   totals.entries.textContent = visibleRecords.length.toLocaleString("en-GB");
+  totals.people.textContent = people.size.toLocaleString("en-GB");
   totals.days.textContent = days.size.toLocaleString("en-GB");
 }
 
@@ -218,6 +449,22 @@ function renderSortIndicators() {
       button.removeAttribute("aria-sort");
     }
   });
+}
+
+function renderPersonFilter() {
+  const current = personFilter.value;
+  const people = [...new Map(records.map((record) => [personKey(record), fullName(record)])).entries()]
+    .filter(([key, name]) => key && name)
+    .sort((a, b) => a[1].localeCompare(b[1]));
+
+  personFilter.innerHTML = '<option value="">All people</option>';
+  for (const [key, name] of people) {
+    const option = document.createElement("option");
+    option.value = key;
+    option.textContent = name;
+    personFilter.append(option);
+  }
+  personFilter.value = people.some(([key]) => key === current) ? current : "";
 }
 
 function renderTable() {
@@ -245,14 +492,16 @@ function renderTable() {
 }
 
 function render() {
+  renderPersonFilter();
   renderTable();
 }
 
 function saveRecord(event) {
   event.preventDefault();
 
-  const record = getFormValues();
-  const existingIndex = records.findIndex((item) => item.id === record.id);
+  const formRecord = getFormValues();
+  const existingIndex = records.findIndex((item) => item.id === formRecord.id);
+  const record = withCurrentUserAudit(formRecord, records[existingIndex]);
 
   if (existingIndex >= 0) {
     records[existingIndex] = record;
@@ -262,7 +511,7 @@ function saveRecord(event) {
     showToast("Hours row saved.");
   }
 
-  saveRecords();
+  saveRecords({ upsertRemoteRecords: [record] });
   resetForm();
   render();
 }
@@ -275,6 +524,7 @@ function startEdit(id) {
   formTitle.textContent = "Edit hours";
   submitLabel.textContent = "Update hours";
   cancelEditButton.hidden = false;
+  saveDraft();
   document.querySelector("#dateWorked").focus();
 }
 
@@ -285,7 +535,8 @@ function deleteRecord(id) {
   if (!confirm("Delete this hours row?")) return;
 
   records = records.filter((item) => item.id !== id);
-  saveRecords();
+  persistRecords(records);
+  void deleteRemoteRecords([id]);
   render();
   showToast("Hours row deleted.");
 }
@@ -295,7 +546,7 @@ function clearAllRecords() {
   if (!confirm("Clear all hours rows?")) return;
 
   records = [];
-  saveRecords();
+  saveRecords({ replaceRemote: true });
   resetForm();
   render();
   showToast("All hours rows cleared.");
@@ -350,6 +601,7 @@ function workbookRows() {
 
 function exportValue(record, key) {
   if (key === "dateWorked") return formatDateForExport(record[key]);
+  if (key === "fullName") return fullName(record);
   if (key === "cashAmount") return Number((Number(record.cashAmount) || fixedHourlyRate).toFixed(2));
   if (key === "totalForDate") return Number(rowTotal(record).toFixed(2));
   return record[key] ?? "";
@@ -357,11 +609,11 @@ function exportValue(record, key) {
 
 function getExcelExportFileName() {
   const value = excelFileNameInput.value.trim();
-  const pattern = /^(January|February|March|April|May|June|July|August|September|October|November|December)_[0-9]{4}_Caitlin_Beaty$/;
+  const pattern = /^(January|February|March|April|May|June|July|August|September|October|November|December)_[0-9]{4}_Hours_Tracker$/;
 
   if (!pattern.test(value)) {
     excelFileNameInput.focus();
-    showToast("Excel name must be Month_Year_Caitlin_Beaty.");
+    showToast("Excel name must be Month_Year_Hours_Tracker.");
     return "";
   }
 
@@ -422,6 +674,9 @@ function headerToKey(header) {
     dateworked: "dateWorked",
     wc: "dateWorked",
     comments: "comments",
+    person: "fullName",
+    name: "fullName",
+    fullname: "fullName",
     firstname: "firstName",
     first_name: "firstName",
     lastname: "lastName",
@@ -447,10 +702,10 @@ async function importFile(event) {
   try {
     const extension = file.name.split(".").pop()?.toLowerCase();
     const rows = extension === "xls" || extension === "xlsx" ? await readExcelRows(file) : parseCsv(await file.text());
-    const imported = rowsToRecords(rows);
+    const imported = rowsToRecords(rows).map((record) => withCurrentUserAudit(record));
 
     records = [...imported, ...records];
-    saveRecords();
+    saveRecords({ upsertRemoteRecords: imported });
     render();
     showToast(`${imported.length} hours row${imported.length === 1 ? "" : "s"} imported.`);
   } catch (error) {
@@ -495,14 +750,20 @@ function rowsToRecords(rows) {
     .map((row) => {
       const record = {
         id: makeId(),
-        firstName: fixedFirstName,
-        lastName: fixedLastName,
+        firstName: defaultFirstName,
+        lastName: defaultLastName,
         cashAmount: fixedHourlyRate,
       };
       row.forEach((value, index) => {
         const key = mappedHeaders[index];
-        if (!key || key === "firstName" || key === "lastName" || key === "cashAmount" || key === "totalForDate") return;
-        record[key] = normaliseImportedValue(key, value);
+        if (!key || key === "cashAmount" || key === "totalForDate") return;
+        if (key === "fullName") {
+          const [firstName, ...lastNameParts] = String(value ?? "").trim().split(/\s+/);
+          record.firstName = firstName || defaultFirstName;
+          record.lastName = lastNameParts.join(" ") || "";
+        } else {
+          record[key] = normaliseImportedValue(key, value);
+        }
       });
       return record;
     })
@@ -588,12 +849,18 @@ function showToast(message) {
 form.addEventListener("submit", saveRecord);
 cancelEditButton.addEventListener("click", resetForm);
 hoursInput.addEventListener("input", updateDateTotal);
+form.addEventListener("input", saveDraft);
+form.addEventListener("change", saveDraft);
 searchInput.addEventListener("input", renderTable);
+personFilter.addEventListener("change", renderTable);
 exportButton.addEventListener("click", exportCsv);
 exportExcelButton.addEventListener("click", exportExcel);
 importButton.addEventListener("click", () => importInput.click());
 importInput.addEventListener("change", importFile);
 clearAllButton.addEventListener("click", clearAllRecords);
+logoutButton.addEventListener("click", () => {
+  window.location.href = "/api/logout";
+});
 
 document.querySelectorAll("thead button[data-sort]").forEach((button) => {
   button.addEventListener("click", () => {
@@ -607,4 +874,7 @@ document.querySelectorAll("thead button[data-sort]").forEach((button) => {
   });
 });
 
+restoreDraft();
 render();
+void loadCurrentUser();
+void syncRemoteRecords();
